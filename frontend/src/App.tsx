@@ -8,9 +8,9 @@ import PreviewPage from './pages/PreviewPage';
 function App() {
   return (
     <BrowserRouter>
-      <div className="min-h-screen bg-gradient-to-b from-gray-50 to-gray-100 dark:from-slate-900 dark:to-slate-800">
+      <div className="min-h-screen bg-gradient-to-b from-gray-50 to-gray-100 dark:from-slate-900 dark:to-slate-800 flex flex-col">
         <AppBar />
-        <main className="pt-16">
+        <main className="flex-1">
           <Routes>
             <Route path="/" element={<HomePage />} />
             <Route path="/upload" element={<UploadPage />} />

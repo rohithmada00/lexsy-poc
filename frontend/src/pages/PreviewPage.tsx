@@ -60,7 +60,7 @@ export default function PreviewPage() {
 
   if (isLoading) {
     return (
-      <div className="max-w-4xl mx-auto px-4 py-16">
+      <div className="max-w-4xl w-full mx-auto px-4">
         <Card>
           <ProgressIndicator message="Generating filled document..." />
         </Card>
@@ -70,7 +70,7 @@ export default function PreviewPage() {
 
   if (error) {
     return (
-      <div className="max-w-4xl mx-auto px-4 py-16">
+      <div className="max-w-4xl w-full mx-auto px-4">
         <Card>
           <div className="p-4 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg mb-4">
             <p className="text-sm text-red-600 dark:text-red-400">{error}</p>
@@ -85,8 +85,9 @@ export default function PreviewPage() {
   }
 
   return (
-    <div className="max-w-4xl mx-auto px-4 py-16">
-      <Card>
+    <div className="flex items-center justify-center min-h-[calc(100vh-4rem)] py-12">
+      <div className="max-w-4xl w-full mx-auto px-4">
+        <Card>
         <h1 className="text-3xl font-bold text-gray-900 dark:text-gray-100 mb-2">
           Document Preview
         </h1>
@@ -120,6 +121,7 @@ export default function PreviewPage() {
           </Button>
         </div>
       </Card>
+      </div>
     </div>
   );
 }

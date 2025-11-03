@@ -29,7 +29,7 @@ export default function Button({
 
   return (
     <button
-      className={`${baseClasses} ${variantClasses[variant]} ${sizeClasses[size]} ${className}`}
+      className={`${baseClasses} ${variantClasses[variant]} ${sizeClasses[size]} flex items-center justify-center ${className}`}
       {...props}
     >
       {children}
