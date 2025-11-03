@@ -16,7 +16,7 @@ export default function ChatPage() {
   const [currentFieldIndex, setCurrentFieldIndex] = useState(0);
   const [allFieldsFilled, setAllFieldsFilled] = useState(false);
   const greetingInitializedRef = useRef(false);
-  
+
   const { messages, sendMessage, addMessage, isStreaming, reset } = useStreamingChat();
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const chatContainerRef = useRef<HTMLDivElement>(null);
@@ -41,9 +41,9 @@ export default function ChatPage() {
     }
 
     // Check if greeting already exists
-    const hasGreeting = messages.some(msg => 
-      msg.role === 'assistant' && 
-      msg.content.includes("Hello! I'll help you fill in the placeholders")
+    const hasGreeting = messages.some(msg =>
+      msg.role === 'assistant' &&
+      (msg.content.includes("👋 Hi there!") || msg.content.includes("Let's start with"))
     );
 
     if (hasGreeting) {
@@ -54,10 +54,25 @@ export default function ChatPage() {
     // Initialize chat with greeting message from AI (only once)
     if (analysis.aiAnalysis.fields && analysis.aiAnalysis.fields.length > 0) {
       greetingInitializedRef.current = true;
+
+      // Use backend's document summary or fallback to a default message
+      const summary = analysis.documentSummary || 'legal document';
+      const count = analysis.aiAnalysis.fields.length;
+
+      // Create intro message with the new format
+      const introMsg: ChatMessageType = {
+        id: (Date.now() - 1).toString(),
+        role: 'assistant',
+        content: `👋 Hi there!\n\nI've reviewed your document. ${summary}\n\nThere are **${count} field${count !== 1 ? 's' : ''}** that need to be filled out. Let's begin!`,
+        timestamp: new Date(),
+      };
+      addMessage(introMsg);
+
+      // Add greeting with first field
       const firstField = analysis.aiAnalysis.fields[0];
-      const greeting = `Hello! I'll help you fill in the placeholders for your document. Let's start with "${firstField.name}". ${firstField.suggestion ? `I suggest "${firstField.suggestion}". ` : ''}What value would you like to use?`;
-      
-      // Add greeting as assistant message
+      const greeting = `Alright, let's begin with **${firstField.label}**.${firstField.exampleValue ? ` For example: _${firstField.exampleValue}_.` : ''} ${firstField.legalSuggestions ? `💡 ${firstField.legalSuggestions}` : ''} What would you like to enter?`;
+
+
       const greetingMsg: ChatMessageType = {
         id: Date.now().toString(),
         role: 'assistant',
@@ -76,67 +91,100 @@ export default function ChatPage() {
   const handleSend = async (userMessage: string) => {
     if (!analysis) return;
 
-    // Store the user message immediately (it will be added by the hook)
-    // Process user message through streaming chat
-    await sendMessage(userMessage, analysis.extractedText);
+    // Prepare context for the API
+    const currentField = fields[currentFieldIndex];
+    const context = {
+      currentPlaceholderKey: currentField?.key || currentField?.label,
+      lastQuestion: messages[messages.length - 1]?.content || '',
+      unfilledPlaceholders: fields
+        .filter(f => !f.value && fields.indexOf(f) >= currentFieldIndex)
+        .map(f => ({
+          key: f.key,
+          label: f.label,
+          originalPattern: f.originalPattern,
+        })),
+    };
 
-    // Wait a bit for streaming to complete, then process the response
-    setTimeout(() => {
-      // Extract value from user message (simple heuristic - could be improved)
-      const currentField = fields[currentFieldIndex];
-      if (currentField && currentFieldIndex < fields.length) {
-        // Try to extract a value from the message
-        // This is a simple implementation - could be improved with NLP
-        const value = userMessage.trim();
-        
-        // Check if the message seems like a value (not a question)
-        const isQuestion = value.toLowerCase().includes('what') || 
-                          value.toLowerCase().includes('how') || 
-                          value.toLowerCase().includes('?');
-        
-        if (value && !isQuestion && value.length > 0) {
+    // Process user message through streaming chat and get parsed response
+    const parsedResponse = await sendMessage(userMessage, context);
+
+    // Process response based on mode
+    if (parsedResponse?.mode === 'fill' && parsedResponse.value) {
+      // Fill mode: extract value and update field
+      const fieldKey = parsedResponse.field;
+      if (fieldKey) {
+        const fieldIndex = fields.findIndex(f => f.key === fieldKey || f.label === fieldKey);
+        if (fieldIndex !== -1) {
+          const fieldToUpdate = fields[fieldIndex];
+          const valueToUse = parsedResponse.suggestion || parsedResponse.value;
+
           const updatedFields = [...fields];
-          updatedFields[currentFieldIndex] = { ...currentField, value };
+          updatedFields[fieldIndex] = { ...fieldToUpdate, value: valueToUse };
           setFields(updatedFields);
 
-          // Move to next field
-          if (currentFieldIndex < fields.length - 1) {
-            setCurrentFieldIndex(currentFieldIndex + 1);
-            const nextField = updatedFields[currentFieldIndex + 1];
-            const nextQuestion = `Great! Now let's fill "${nextField.name}". ${nextField.suggestion ? `I suggest "${nextField.suggestion}". ` : ''}What value would you like to use?`;
-            
-            // Add AI response as message
-            setTimeout(() => {
-              const aiMsg: ChatMessageType = {
-                id: (Date.now() + 1).toString(),
-                role: 'assistant',
-                content: nextQuestion,
-                timestamp: new Date(),
-              };
-              addMessage(aiMsg);
-            }, 1000);
-          } else {
-            // All fields filled
-            setAllFieldsFilled(true);
-            setTimeout(() => {
-              const completionMsg: ChatMessageType = {
-                id: (Date.now() + 2).toString(),
-                role: 'assistant',
-                content: 'Perfect! I\'ve collected all the information. You can now proceed to preview and download your filled document.',
-                timestamp: new Date(),
-              };
-              addMessage(completionMsg);
-            }, 1000);
+          // Update current field index if we filled the current field
+          if (fieldIndex === currentFieldIndex) {
+            // Move to next field
+            const nextFieldIndex = currentFieldIndex + 1;
+            if (nextFieldIndex < fields.length) {
+              setCurrentFieldIndex(nextFieldIndex);
+              const nextField = updatedFields[nextFieldIndex];
+              const nextQuestion = `Excellent. Now let's proceed to **${nextField.label}**.${nextField.exampleValue ? ` For instance: ${nextField.exampleValue}.` : ''} ${nextField.legalSuggestions ? `Note: ${nextField.legalSuggestions}` : ''} Please provide the value.`;
+
+              // Add AI response as message
+              setTimeout(() => {
+                const aiMsg: ChatMessageType = {
+                  id: (Date.now() + 1).toString(),
+                  role: 'assistant',
+                  content: nextQuestion,
+                  timestamp: new Date(),
+                };
+                addMessage(aiMsg);
+              }, 500);
+            } else {
+              // All fields filled
+              setAllFieldsFilled(true);
+              setTimeout(() => {
+                const completionMsg: ChatMessageType = {
+                  id: (Date.now() + 2).toString(),
+                  role: 'assistant',
+                  content: 'Perfect! I\'ve collected all the information. You can now proceed to preview and download your filled document.',
+                  timestamp: new Date(),
+                };
+                addMessage(completionMsg);
+              }, 500);
+            }
           }
         }
       }
-    }, 2000); // Wait 2 seconds for streaming to complete
+    }
+    // For chat mode, the response is already displayed in the hook
   };
 
   const handleProceedToPreview = () => {
     // Store filled fields for preview page
     sessionStorage.setItem('filledFields', JSON.stringify(fields));
+
+    // Store normalized data (responsibility of frontend - from analyze API response)
+    if (analysis?.normalizedText) {
+      sessionStorage.setItem('normalizedText', analysis.normalizedText);
+    }
+    if (analysis?.normalizedHtml) {
+      sessionStorage.setItem('normalizedHtml', analysis.normalizedHtml);
+    }
+    if (analysis?.normalizedDocumentBuffer) {
+      sessionStorage.setItem('normalizedDocumentBuffer', analysis.normalizedDocumentBuffer);
+    }
+
+    // Keep original data for backward compatibility (can be removed later)
     sessionStorage.setItem('originalText', analysis?.extractedText || '');
+    if (analysis?.documentHtml) {
+      sessionStorage.setItem('originalHtml', analysis.documentHtml);
+    }
+    if (analysis?.documentBuffer) {
+      sessionStorage.setItem('originalBuffer', analysis.documentBuffer);
+    }
+
     navigate('/preview');
   };
 
@@ -186,8 +234,8 @@ export default function ChatPage() {
                   className="truncate max-w-xs"
                   title={analysis.filename}
                 >
-                  {analysis.filename.length > 40 
-                    ? `${analysis.filename.substring(0, 37)}...` 
+                  {analysis.filename.length > 40
+                    ? `${analysis.filename.substring(0, 37)}...`
                     : analysis.filename}
                 </span>
                 <span className="shrink-0">• {fields.length} placeholder{fields.length !== 1 ? 's' : ''} found</span>
@@ -206,21 +254,20 @@ export default function ChatPage() {
               Start Over
             </Button>
           </div>
-          
+
           {fields.length > 0 && (
             <div className="flex flex-wrap gap-2">
               {fields.map((field, idx) => (
                 <span
                   key={idx}
-                  className={`text-xs px-3 py-1.5 rounded-md font-medium whitespace-nowrap inline-flex items-center ${
-                    idx < currentFieldIndex
-                      ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/50 dark:text-emerald-200'
-                      : idx === currentFieldIndex
+                  className={`text-xs px-3 py-1.5 rounded-md font-medium whitespace-nowrap inline-flex items-center ${idx < currentFieldIndex
+                    ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/50 dark:text-emerald-200'
+                    : idx === currentFieldIndex
                       ? 'bg-blue-100 text-blue-800 dark:bg-blue-900/50 dark:text-blue-200'
                       : 'bg-gray-100 text-gray-700 dark:bg-slate-700 dark:text-gray-300'
-                  }`}
+                    }`}
                 >
-                  {field.name}{field.value ? ' ✓' : ''}
+                  {field.label}{field.value ? ' ✓' : ''}
                 </span>
               ))}
             </div>
@@ -245,11 +292,11 @@ export default function ChatPage() {
               <p className="text-base">Starting conversation...</p>
             </div>
           )}
-          
+
           {messages.map((msg) => (
             <ChatMessage key={msg.id} message={msg} />
           ))}
-          
+
           {isStreaming && <TypingIndicator />}
           <div ref={messagesEndRef} className="h-4" />
         </div>

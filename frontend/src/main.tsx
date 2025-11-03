@@ -15,7 +15,7 @@ createRoot(rootElement).render(
   <StrictMode>
     <ErrorBoundary>
       <ThemeProvider>
-        <App />
+    <App />
       </ThemeProvider>
     </ErrorBoundary>
   </StrictMode>,

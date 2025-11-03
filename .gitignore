@@ -39,6 +39,6 @@ coverage/
 # Production
 *.pem
 
-# # Docs
+# # # Docs
 # docs/
 # backend/
