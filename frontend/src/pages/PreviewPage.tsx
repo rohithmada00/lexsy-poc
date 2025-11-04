@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { fillDocument, downloadDocument } from '../services/api';
+import { fillDocument } from '../services/api';
 import Card from '../components/Card';
 import DocumentPreview from '../components/DocumentPreview';
 import Button from '../components/Button';
@@ -11,7 +11,6 @@ export default function PreviewPage() {
   const navigate = useNavigate();
   const [filledText, setFilledText] = useState<string | null>(null);
   const [filledHtml, setFilledHtml] = useState<string | null>(null);
-  const [originalText, setOriginalText] = useState<string>('');
   const [fields, setFields] = useState<DocumentField[]>([]);
   const [documentBuffer, setDocumentBuffer] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -28,7 +27,6 @@ export default function PreviewPage() {
     // Fallback to original data if normalized data not available (backward compatibility)
     const storedHtml = sessionStorage.getItem('originalHtml');
     const storedBuffer = sessionStorage.getItem('originalBuffer');
-    const storedText = sessionStorage.getItem('originalText');
 
     if (!storedFields) {
       navigate('/chat');
@@ -63,7 +61,6 @@ export default function PreviewPage() {
 
     // Store buffer for download component
     setDocumentBuffer(normalizedBuffer);
-    setOriginalText(storedText || '');
 
     // Fill the document using normalized data (call download API with normalized data)
     fillDocument(normalizedBuffer, normalizedHtml, parsedFields, 'both')

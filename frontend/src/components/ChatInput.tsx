@@ -1,6 +1,5 @@
 import { useState } from 'react';
 import type { KeyboardEvent } from 'react';
-import Button from './Button';
 
 interface ChatInputProps {
   onSend: (message: string) => void;

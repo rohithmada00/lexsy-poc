@@ -51,7 +51,6 @@ export function useStreamingChat() {
 
       // Stream the response - accumulate content and display it in real-time
       let fullContent = '';
-      let isJsonResponse = false;
       
       for await (const chunk of streamChat(apiMessages, context)) {
         if (chunk.done) {
@@ -66,7 +65,6 @@ export function useStreamingChat() {
               let jsonContent = cleanedContent.replace(/^```json\s*/i, "").replace(/\s*```$/i, "");
               
               parsedResponse = JSON.parse(jsonContent) as ChatResponse;
-              isJsonResponse = true;
               
               // Update message content based on mode - only show user-friendly content
               let displayContent = '';

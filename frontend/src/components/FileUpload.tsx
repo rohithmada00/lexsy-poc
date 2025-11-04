@@ -1,6 +1,5 @@
 import { useRef, useState } from 'react';
 import type { DragEvent } from 'react';
-import Button from './Button';
 
 interface FileUploadProps {
   onFileSelect: (file: File) => void;

@@ -4,7 +4,6 @@ import { analyzeDocument } from '../services/api';
 import FileUpload from '../components/FileUpload';
 import Card from '../components/Card';
 import ProgressIndicator from '../components/ProgressIndicator';
-import Button from '../components/Button';
 import type { AnalyzeResponse } from '../types';
 
 export default function UploadPage() {
