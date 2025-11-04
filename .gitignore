@@ -39,6 +39,7 @@ coverage/
 # Production
 *.pem
 
-# # # Docs
-# docs/
-# backend/
+# Environment files
+.env
+.env.*
+!.env.example
