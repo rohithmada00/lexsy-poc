@@ -5,8 +5,6 @@ import mammoth from "mammoth";
 import dotenv from "dotenv";
 import OpenAI from "openai";
 import JSZip from "jszip";
-import fs from "fs";
-import path from "path";
 
 dotenv.config();
 
@@ -15,223 +13,203 @@ const upload = multer({ storage: multer.memoryStorage() });
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 app.use(cors());
-// Increase body size limit to handle large base64-encoded document buffers
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
-// -------------------------------------------------------------
-// 🧾 Request logging middleware
-// -------------------------------------------------------------
-app.use((req, res, next) => {
-    const timestamp = new Date().toISOString();
-    console.log(`\n[${timestamp}] 📥 ${req.method} ${req.path}`);
-    next();
-});
-
-
-// -------------------------------------------------------------
-// 📄 Upload + Analyze Document (placeholders + summary)
-// -------------------------------------------------------------
 app.post("/api/analyze", upload.single("document"), async (req, res) => {
-    const startTime = Date.now();
-    console.log(`[API] POST /api/analyze - Document analysis request`);
-
     try {
         if (!req.file) {
             return res.status(400).json({ error: "No file uploaded" });
         }
 
-        const { buffer, originalname, size } = req.file;
-        console.log(`[API] POST /api/analyze - File received: ${originalname} (${size} bytes)`);
+        const { buffer, originalname } = req.file;
 
-        // Extract both plain text (for AI) and HTML (for styled preview)
-        const [textResult, htmlResult] = await Promise.all([
-            mammoth.extractRawText({ buffer }),
-            mammoth.convertToHtml({
-                buffer,
-                styleMap: [
-                    "p[style-name='Heading 1'] => h1:fresh",
-                    "p[style-name='Heading 2'] => h2:fresh",
-                    "p[style-name='Heading 3'] => h3:fresh",
-                    "p[style-name='Title'] => h1.title:fresh",
-                    "r[style-name='Strong'] => strong",
-                    "p[style-name='Quote'] => blockquote:fresh"
-                ]
-            })
-        ]);
-        const text = textResult.value;
-        const documentHtml = htmlResult.value;
-        console.log(`[API] POST /api/analyze - Text extracted: ${text.length} characters`);
-        console.log(`[API] POST /api/analyze - HTML extracted: ${documentHtml.length} characters`);
+        // Load raw XML and extracted text
+        const zip = await JSZip.loadAsync(buffer);
+        const documentXml = await zip.file("word/document.xml").async("string");
+        const mammothResult = await mammoth.extractRawText({ buffer });
+        const extractedText = mammothResult.value || "";
 
-        // Limit summary input to first 2000 chars
-        const summaryInput = text.slice(0, 2000);
+        const MAX_CHUNK = 25000;
+        let allPlaceholders = [];
 
+        // Function to detect placeholders in one chunk
+        const detectPlaceholders = async (text, xml, label = "full") => {
+            const prompt = `
+                 You are reviewing a legal or financial document template to find every location where a user must enter custom information.
+            
+                IMPORTANT: Examine the document from start to finish. Capture ALL fields at:
+                - The BEGINNING (often includes parties and overview details)
+                - The MIDDLE (contains operative contract terms)
+                - The END (signature pages, boilerplate termination clauses, etc.)
+            
+                FIND EVERY FILLED-IN FIELD, INCLUDING (but not limited to):
+                - Explicit placeholders like [___], {{name}}, [COMPANY NAME], [name], [title], [STATE OF INCORPORATION]
+                - Blank lines or underscores (e.g., "______", "______________", or long blanks)
+                - Financial terms and numeric inputs ("Post-Money Valuation Cap", "Purchase Amount", "Equity Percentage", etc.)
+                - Signature blocks, including labeled lines such as "By:", "Name:", "Title:", "Address:", "Email:"
+                - Date fields, jurisdiction fields, party name fields, company identifiers, payment fields, etc.
+                - Labeled fields with spaces/underscores even if not bracketed (e.g., "Effective Date: ________", "Name: __________")
+                - Any phrase followed by a blank or value placeholder (e.g., "Purchase Price: $[_____]", "Valuation Cap: $[_______]")
+            
+                ESSENTIAL REQUIREMENTS:
+                - DO NOT skip over the signature pages or footer sections
+                - Treat any labeled line or legal term followed by a blank/value as a placeholder
 
-        const extractionPrompt = `
-        You are reviewing a legal template to find every spot that must be filled in by a human.
-        
-        NON-NEGOTIABLE: Examine the FULL document. Capture items at:
-        - The START of the file
-        - The MIDDLE sections
-        - The FINAL pages (signature pages are commonly overlooked)
-        
-        WHAT TO EXTRACT (include all that apply):
-        - Explicit placeholders such as [___], {{name}}, [COMPANY NAME], [COMPANY], [name], [title]
-        - Blank lines or underscored areas meant for input: ________ or long horizontal blanks
-        - Any instruction-like text (e.g., "insert X here")
-        - Labeled fields with lines or space after them (e.g., "Name:" followed by blanks)
-        - Standard contract variables: party names, dates, amounts, governing law, addresses, emails, signatures, etc.
-        - Signature blocks: entries like "By:", "Name:", "Title:", "Address:", "Email:" and any related lines underneath
-        
-        STRICT TASKING:
-        - Do NOT miss the signature page(s) or anything near the very end
-        - Treat labeled lines as fields even if no brackets/underscores are present
-        - Count how many times each placeholder appears in the entire document (e.g., if “[Company Name]” shows up twice, numberOfOccurrences is "2")
-        
-        OUTPUT FORMAT (RETURN JSON ONLY):
-        {
-          "fields": [
-            {
-              "key": "snake_case_key",
-              "label": "Readable label",
-              "description": "Optional short note",
-              "type": "text|number|currency|date|email|address|signature",
-              "required": true|false,
-              "originalPattern": "EXACT text including brackets/underscores as it appears in the doc",
-              "exampleValue": "Example value",
-              "legalSuggestions": "Short legal guidance",
-              "numberOfOccurrences": "Number of occurrences of the placeholder in the document"
+                Analyze based on the following sources:
+                ${text}
+
+                Return a JSON object:
+
+                {
+                    "placeholders": [
+                        {
+                            "key": "a unique key here (e.g. investor_name)",
+                            "label": "Readable placeholder label (e.g. Investor Name)",
+                            "type": "text | number | currency | date | email | address | signature",
+                            "question": "1-2 sentence intuitive question to ask the user (e.g. What is the investor's name?)",
+                            "originalPattern": "The exact placeholder found in the document (e.g. [Investor Name])",
+                            "numberOfOccurrences": "How many times this placeholder appears in the full document"
+                        }
+                    ]
+                }
+            `;
+
+            const completion = await openai.chat.completions.create({
+                model: "gpt-4o-mini",
+                temperature: 0.3,
+                messages: [
+                    { role: "system", content: "You are a legal placeholder extractor. Only output valid JSON." },
+                    { role: "user", content: prompt }
+                ],
+                response_format: { type: "json_object" },
+                max_tokens: 2000
+            });
+
+            let content = completion.choices[0].message.content || "";
+            content = content.replace(/```json|```/g, "").trim();
+
+            try {
+                const parsed = JSON.parse(content);
+                return parsed.placeholders || [];
+            } catch {
+                const sanitized = content.replace(/[\u0000-\u001f]/g, "");
+                const parsed = JSON.parse(sanitized);
+                return parsed.placeholders || [];
             }
-          ]
+        };
+
+        // Chunk the document if needed
+        if (extractedText.length <= MAX_CHUNK && documentXml.length <= MAX_CHUNK) {
+            allPlaceholders = await detectPlaceholders(extractedText, documentXml);
+        } else {
+            let start = 0;
+            let idx = 0;
+            const overlap = 1000;
+
+            while (start < extractedText.length) {
+                const textChunk = extractedText.slice(start, start + MAX_CHUNK);
+                const xmlChunk = documentXml.slice(start, start + MAX_CHUNK);
+
+                const chunkPlaceholders = await detectPlaceholders(textChunk, xmlChunk, `chunk_${idx}`);
+                allPlaceholders.push(...chunkPlaceholders);
+
+                start += (MAX_CHUNK - overlap);
+                idx++;
+            }
         }
-        
-        JSON CONSTRAINTS:
-        - Escape inner quotes using \\"
-        - No tabs, newlines, or control characters inside strings
-        - Output must be valid JSON (no comments, no trailing commas)
-        - If nothing is found, respond with: { "fields": [] }
-        `;
 
-        const summaryPrompt = `Summarize the document in 2-3 sentences. Use generic roles (the company, the investor).`;
-
-        const placeholderExtractionPromise = openai.chat.completions.create({
-            model: "gpt-4o-mini",
-            temperature: 0.3,
-            response_format: { type: "json_object" },
-            messages: [
-                { role: "system", content: extractionPrompt },
-                { role: "user", content: text },
-            ],
-        });
-
-        const summaryPromise = openai.chat.completions.create({
+        // Request a summary of the document
+        const summaryPrompt = `Summarize this legal document in 2-3 sentences. Use general roles such as "the company" and "the investor".`;
+        const summaryCompletion = await openai.chat.completions.create({
             model: "gpt-4o-mini",
             temperature: 0.4,
             max_tokens: 100,
             messages: [
                 { role: "system", content: summaryPrompt },
-                { role: "user", content: summaryInput },
+                { role: "user", content: extractedText.slice(0, 2000) }
             ],
         });
+        const documentSummary = summaryCompletion.choices[0].message.content.trim().replace(/[\n\r]+/g, " ");
 
-        // Run both requests in parallel
-        const [placeholderExtraction, summaryCompletion] = await Promise.all([
-            placeholderExtractionPromise,
-            summaryPromise,
-        ]);
-
-        // Handle JSON safely
-        let raw = placeholderExtraction.choices[0].message.content.trim();
-        let parsedFields;
-        try {
-            parsedFields = JSON.parse(raw);
-        } catch {
-            parsedFields = { fields: [] };
-        }
-
-        const fields = parsedFields.fields || [];
-        const documentSummary = summaryCompletion.choices[0].message.content.trim()
-            .replace(/[\n\r]+/g, " ");
-
-        // Create normalized versions
-        const originalBufferBase64 = buffer.toString('base64');
-        const zip = await JSZip.loadAsync(buffer);
-        let documentXml = await zip.file("word/document.xml").async("string");
+        const htmlResult = await mammoth.convertToHtml({ buffer });
 
         let normalizedXml = documentXml;
-        let normalizedText = text;
-        let normalizedHtml = documentHtml;
+        let normalizedText = extractedText;
+        let normalizedHtml = htmlResult.value;
 
-        // // Normalize placeholders: replace only the FIRST match of each pattern sequentially
-        // // This preserves visual order and prevents accidental duplicates in .docx XML
-        // // Important: Process each field's pattern one at a time, replacing only the first occurrence
-        // // before moving to the next field. This ensures correct visual order in the document.
-        fields.forEach((field) => {
-            const { originalPattern, key, numberOfOccurrences } = field;
-            if (!originalPattern || !key) return;
+        allPlaceholders.forEach((p) => {
+            const { originalPattern, key, numberOfOccurrences } = p;
+            const occurrences = Number(numberOfOccurrences);
 
-            const escapedPattern = originalPattern.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&");
-            const regex = new RegExp(escapedPattern, "g");
+            if (!originalPattern || !key || isNaN(occurrences)) {
+                return;
+            }
 
-            // Replace ONLY the first N matches in docx XML
-            normalizedXml = replaceFirstNOccurrences(
-                normalizedXml,
-                regex,
-                `{{${key}}}`,
-                Number(numberOfOccurrences)
-            );
+            const replacement = `{{${key}}}`; // single key for all matches
 
-            // Same for text + html previews
-            normalizedText = replaceFirstNOccurrences(
-                normalizedText,
-                regex,
-                `{{${key}}}`,
-                Number(numberOfOccurrences)
-            );
+            // Escape for exact text matching
+            const escapedPattern = originalPattern.replace(/[-\/\\^$*+?.()|[\]{}]/g, "\\$&");
+            const plainRegex = new RegExp(escapedPattern, "g");
 
-            normalizedHtml = replaceFirstNOccurrences(
-                normalizedHtml,
-                regex,
-                `{{${key}}}`,
-                Number(numberOfOccurrences)
-            );
+            // XML boundary-tolerant
+            const xmlRegex = createXmlBoundaryTolerantRegex(originalPattern);
+
+            // Check if pattern exists before replacement
+            const textMatches = normalizedText.match(plainRegex);
+            const htmlMatches = normalizedHtml.match(plainRegex);
+            const xmlMatches = normalizedXml.match(xmlRegex);
+
+            if (!textMatches && !htmlMatches && !xmlMatches) {
+                const flexiblePattern = originalPattern.replace(/[\[\]]/g, '').trim();
+                const flexibleEscaped = flexiblePattern.replace(/[-\/\\^$*+?.()|[\]{}]/g, "\\$&");
+                const flexibleRegex = new RegExp(flexibleEscaped.replace(/\s+/g, '\\s+'), "g");
+
+                const textMatchesFlex = normalizedText.match(flexibleRegex);
+                if (textMatchesFlex) {
+                    normalizedText = replaceFirstNOccurrences(normalizedText, flexibleRegex, replacement, occurrences);
+                }
+                const htmlMatchesFlex = normalizedHtml.match(flexibleRegex);
+                if (htmlMatchesFlex) {
+                    normalizedHtml = replaceFirstNOccurrences(normalizedHtml, flexibleRegex, replacement, occurrences);
+                }
+            } else {
+                normalizedText = replaceFirstNOccurrences(normalizedText, plainRegex, replacement, occurrences);
+                normalizedHtml = replaceFirstNOccurrences(normalizedHtml, plainRegex, replacement, occurrences);
+                normalizedXml = replaceFirstNOccurrences(normalizedXml, xmlRegex, replacement, occurrences);
+            }
         });
 
-
-        // Recreate zip with normalized document.xml
-        zip.file("word/document.xml", normalizedXml);
-        const normalizedDocumentBuffer = await zip.generateAsync({ type: "base64" });
-
-        // ✅ Response with new normalized outputs (keeping old fields too)
         const response = {
             filename: originalname,
-            extractedText: text,
-            documentHtml,
-            documentBuffer: originalBufferBase64,
-            normalizedText,
-            normalizedHtml,
-            normalizedDocumentBuffer,
-            aiAnalysis: parsedFields,
+            extractedText,
+            documentHtml: normalizedHtml,
+            documentBuffer: buffer.toString('base64'),
+            normalizedText: normalizedText,
+            normalizedHtml: normalizedHtml,
+            normalizedDocumentBuffer: buffer.toString('base64'),
+            aiAnalysis: { fields: allPlaceholders },
             documentSummary,
-            placeholderCount: fields.length,
+            placeholderCount: allPlaceholders.length
         };
 
-        const duration = Date.now() - startTime;
-        console.log(`[API] POST /api/analyze - ✅ Success (${duration}ms)`);
+        zip.file("word/document.xml", normalizedXml);
+        const normalizedDocumentBuffer = await zip.generateAsync({ type: "base64" });
+        response.normalizedDocumentBuffer = normalizedDocumentBuffer;
 
-        res.json(response);
+        return res.json(response);
+
     } catch (err) {
-        console.error(`[API] POST /api/analyze - ❌ Error:`, err.message);
-        res.status(500).json({ error: "AI analysis failed" });
+        console.error(`[API] Error during analysis:`, err);
+        return res.status(500).json({ error: "AI analysis failed" });
     }
 });
+
 
 // -------------------------------------------------------------
 // 💬 Conversational Chat Assistant (Streaming + JSON mode)
 // -------------------------------------------------------------
 app.post("/api/chat", async (req, res) => {
-    const startTime = Date.now();
     const { messages, context } = req.body;
     const stream = req.query.stream === "true" || req.query.stream === "1";
     const { currentPlaceholderKey, lastQuestion, unfilledPlaceholders } = context || {};
@@ -276,8 +254,6 @@ ${JSON.stringify(unfilledPlaceholders || [], null, 2)}
 
     try {
         if (stream) {
-            // --- STREAMING MODE (SSE) ---
-            console.log(`[API] POST /api/chat - Streaming mode enabled`);
             res.setHeader("Content-Type", "text/event-stream");
             res.setHeader("Cache-Control", "no-cache");
             res.setHeader("Connection", "keep-alive");
@@ -300,10 +276,8 @@ ${JSON.stringify(unfilledPlaceholders || [], null, 2)}
 
             res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
             res.end();
-            console.log(`[API] POST /api/chat - ✅ Stream complete (${Date.now() - startTime}ms)`);
 
         } else {
-            // --- NON-STREAMING MODE ---
             const completion = await openai.chat.completions.create({
                 model: "gpt-4o-mini",
                 temperature: 0.3,
@@ -314,20 +288,16 @@ ${JSON.stringify(unfilledPlaceholders || [], null, 2)}
             });
 
             let content = completion.choices[0].message.content.trim();
-
-            // Clean ```json fences if present
             content = content.replace(/^```json\s*/i, "").replace(/\s*```$/i, "");
 
             let responseJSON;
             try {
                 responseJSON = JSON.parse(content);
             } catch {
-                // Fallback: return raw content so UI still renders AI response
                 responseJSON = { message: content };
             }
 
             res.json(responseJSON);
-            console.log(`[API] POST /api/chat - ✅ Success (${Date.now() - startTime}ms)`);
         }
     } catch (err) {
         console.error(`[API] POST /api/chat - ❌ Error:`, err.message);
@@ -345,59 +315,8 @@ ${JSON.stringify(unfilledPlaceholders || [], null, 2)}
 // 📥 Fill Document (for preview and download) - Uses normalized data
 // Accepts normalized data from analyze API and returns both filled HTML and filled docx
 // -------------------------------------------------------------
-
 app.post("/api/download", async (req, res) => {
-    const startTime = Date.now();
-    const format = req.query.format || "both"; // "preview", "download", or "both" (default)
-    console.log(`[API] POST /api/download - Document fill request (format: ${format})`);
-
-    // Save full request to file for observation (with truncated buffers for readability)
-    try {
-        const requestData = {
-            timestamp: new Date().toISOString(),
-            format: format,
-            fields: req.body.fields || [],
-            normalizedDocumentBuffer: req.body.normalizedDocumentBuffer ? {
-                length: req.body.normalizedDocumentBuffer.length,
-                preview: req.body.normalizedDocumentBuffer.substring(0, 100),
-                note: "Full buffer saved separately if needed"
-            } : null,
-            normalizedHtml: req.body.normalizedHtml ? {
-                length: req.body.normalizedHtml.length,
-                preview: req.body.normalizedHtml.substring(0, 500),
-                note: "Full HTML saved separately if needed"
-            } : null,
-            normalizedText: req.body.normalizedText ? {
-                length: req.body.normalizedText.length,
-                preview: req.body.normalizedText.substring(0, 500),
-                note: "Full text saved separately if needed"
-            } : null,
-            // Save full request body with buffers (for complete inspection)
-            fullRequest: {
-                fields: req.body.fields || [],
-                // Include actual buffers for full inspection
-                normalizedDocumentBuffer: req.body.normalizedDocumentBuffer,
-                normalizedHtml: req.body.normalizedHtml,
-                normalizedText: req.body.normalizedText,
-            }
-        };
-
-        const fileName = `download_request_${Date.now()}.json`;
-        const filePath = path.join(process.cwd(), fileName);
-        fs.writeFileSync(filePath, JSON.stringify(requestData, null, 2));
-        console.log(`[API] POST /api/download - 💾 Request saved to: ${fileName}`);
-    } catch (fileErr) {
-        console.error(`[API] POST /api/download - ⚠️ Failed to save request file:`, fileErr.message);
-    }
-
-    // Log request body (excluding full buffers to avoid huge logs)
-    const logBody = {
-        ...req.body,
-        normalizedDocumentBuffer: req.body.normalizedDocumentBuffer ? `${req.body.normalizedDocumentBuffer.substring(0, 50)}... (${req.body.normalizedDocumentBuffer.length} chars)` : undefined,
-        normalizedHtml: req.body.normalizedHtml ? `${req.body.normalizedHtml.substring(0, 100)}... (${req.body.normalizedHtml.length} chars)` : undefined,
-        normalizedText: req.body.normalizedText ? `${req.body.normalizedText.substring(0, 100)}... (${req.body.normalizedText.length} chars)` : undefined
-    };
-    console.log(`[API] POST /api/download - Request JSON:`, JSON.stringify(logBody, null, 2));
+    const format = req.query.format || "both";
 
     try {
         const { normalizedDocumentBuffer, normalizedHtml, normalizedText, fields } = req.body;
@@ -405,107 +324,306 @@ app.post("/api/download", async (req, res) => {
         if (!normalizedDocumentBuffer || !fields) {
             return res.status(400).json({ error: "Missing normalizedDocumentBuffer or fields" });
         }
-
         if (!normalizedHtml && (format === "preview" || format === "both")) {
             return res.status(400).json({ error: "Missing normalizedHtml for preview" });
         }
 
-        console.log(`[API] POST /api/download - Processing ${fields.length} fields`);
+        // Load DOCX XML
+        const base64Buf = Buffer.from(normalizedDocumentBuffer, "base64");
+        const zip = await JSZip.loadAsync(base64Buf);
+        const documentXml = await zip.file("word/document.xml").async("string");
 
-        // Fill HTML for preview (if needed)
-        let filledHtml = normalizedHtml;
-        if (normalizedHtml && (format === "preview" || format === "both")) {
-            let htmlReplacements = 0;
+        // ---------- 1) Extract placeholders (HTML + XML), including label-only ----------
+        // We will scan <p> blocks in HTML and raw XML text runs. We produce ordered "occurrences".
+        // An occurrence = { id, source: 'html'|'xml', start, end, snippetBefore, snippetAfter, labelGuess, hasDollar, kind, raw }
+        const occurrences = [];
 
-            for (const f of fields) {
-                const normalizedPlaceholder = `{{${f.key}}}`;
-                const value = f.value || f.suggestion || "";
+        // Utility: take context windows
+        const ctx = (str, iStart, iEnd, w = 100) => ({
+            before: str.slice(Math.max(0, iStart - w), iStart),
+            after: str.slice(iEnd, iEnd + w),
+        });
 
-                if (!f.key || !value) continue;
+        // Patterns
+        const BRACKET_RE = /\$?\s*\[[^\]]{0,80}\]/g;                 // [Company Name], $[_____], etc.
+        const UNDERSCORE_RE = /\$?\s*[_\-—]{3,}/g;                   // ______, ----, ————
+        // Label+blank (label can be followed by optional blank or nothing; still counts)
+        const LABEL_WORDS = [
+            "By", "Name", "Title", "Address", "Email", "Date",
+            "Company Name", "Investor Name", "Purchase Amount", "Post-Money Valuation Cap",
+            "State of Incorporation", "Governing Law Jurisdiction"
+        ];
+        const LABEL_ONLY_RE = new RegExp(
+            `(?:^|[>\\s])(` +
+            LABEL_WORDS.map(l => l.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|") +
+            `)\\s*:\\s*(?=$|[<\\n\\r])`, "g"
+        );
+        const LABEL_WITH_BLANK_RE = new RegExp(
+            `(?:^|[>\\s])(` +
+            LABEL_WORDS.map(l => l.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|") +
+            `)\\s*:\\s*(?:\\$?\\s*\\[[^\\]]{0,80}\\]|[_\\-—]{3,})`, "g"
+        );
 
-                // Escape HTML special characters in the replacement value
-                const htmlValue = value
-                    .replace(/&/g, "&amp;")
-                    .replace(/</g, "&lt;")
-                    .replace(/>/g, "&gt;")
-                    .replace(/"/g, "&quot;")
-                    .replace(/'/g, "&#39;");
+        let html = normalizedHtml || "";
+        let xml = documentXml || "";
 
-                const escapedPlaceholder = normalizedPlaceholder.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-                const regex = new RegExp(escapedPlaceholder, "g");
-                const matches = (filledHtml.match(regex) || []).length;
-
-                if (matches > 0) {
-                    filledHtml = filledHtml.replace(regex, htmlValue);
-                    htmlReplacements += matches;
-                    console.log(`[API] POST /api/download - HTML: Replaced "${f.key}" (${matches} occurrence(s))`);
-                }
+        // HTML: find [brackets], underscores, label-with-blank, and label-only
+        const scanHtmlWith = (re, kind) => {
+            let m;
+            while ((m = re.exec(html)) !== null) {
+                const start = m.index;
+                const end = m.index + m[0].length;
+                const { before, after } = ctx(html, start, end, 120);
+                const raw = m[0];
+                const labelGuess = (kind === "label_with_blank" || kind === "label_only") ? (m[1] || "").trim() : null;
+                const hasDollar = /\$\s*$/.test(before) || /^\s*\$/.test(after) || /^\s*\$/.test(raw);
+                occurrences.push({
+                    source: "html",
+                    start, end,
+                    raw,
+                    kind,
+                    labelGuess,
+                    hasDollar,
+                    snippetBefore: before,
+                    snippetAfter: after
+                });
             }
-            console.log(`[API] POST /api/download - HTML replacements: ${htmlReplacements}`);
+        };
+
+        scanHtmlWith(BRACKET_RE, "bracket");
+        scanHtmlWith(UNDERSCORE_RE, "underscore");
+        scanHtmlWith(LABEL_WITH_BLANK_RE, "label_with_blank");
+        scanHtmlWith(LABEL_ONLY_RE, "label_only");
+
+        // XML: run the same patterns (best-effort text-level)
+        const scanXmlWith = (re, kind) => {
+            let m;
+            while ((m = re.exec(xml)) !== null) {
+                const start = m.index;
+                const end = m.index + m[0].length;
+                const { before, after } = ctx(xml, start, end, 120);
+                const raw = m[0];
+                const labelGuess = (kind === "label_with_blank" || kind === "label_only") ? (m[1] || "").trim() : null;
+                const hasDollar = /\$\s*$/.test(before) || /^\s*\$/.test(after) || /^\s*\$/.test(raw);
+                occurrences.push({
+                    source: "xml",
+                    start, end,
+                    raw,
+                    kind,
+                    labelGuess,
+                    hasDollar,
+                    snippetBefore: before,
+                    snippetAfter: after
+                });
+            }
+        };
+
+        scanXmlWith(BRACKET_RE, "bracket");
+        scanXmlWith(UNDERSCORE_RE, "underscore");
+        scanXmlWith(LABEL_WITH_BLANK_RE, "label_with_blank");
+        scanXmlWith(LABEL_ONLY_RE, "label_only");
+
+        // Sort top-to-bottom within each source to preserve order
+        const htmlOccs = occurrences.filter(o => o.source === "html").sort((a, b) => a.start - b.start);
+        const xmlOccs = occurrences.filter(o => o.source === "xml").sort((a, b) => a.start - b.start);
+
+        // Assign stable IDs (separate sequences for html and xml so we can replace reliably)
+        htmlOccs.forEach((o, i) => o.id = `h${String(i + 1).padStart(4, "0")}`);
+        xmlOccs.forEach((o, i) => o.id = `x${String(i + 1).padStart(4, "0")}`);
+
+        const allOccs = [...htmlOccs, ...xmlOccs];
+
+        // ---------- 2) Chunking + GPT mapping (occurrence -> field.key) ----------
+        // Prepare fields with values only
+        const fieldsWithValues = (fields || [])
+            .map(f => ({ key: f.key, label: f.label || f.key, type: f.type || 'text', value: f.value || f.suggestion || '' }))
+            .filter(f => f.value);
+
+        // Build a light, safe view of occurrences for the prompt
+        const lightOccs = allOccs.map(o => ({
+            id: o.id,
+            source: o.source,
+            kind: o.kind,
+            labelGuess: o.labelGuess,
+            hasDollar: o.hasDollar,
+            // Provide very small windows to keep token usage low but enough for context
+            textWindow: `${(o.snippetBefore || '').slice(-90)}[BLANK]${(o.snippetAfter || '').slice(0, 90)}`
+        }));
+
+        const MAX_ITEMS_PER_CHUNK = 40; // keep prompts short; adjust if needed
+        const chunks = [];
+        for (let i = 0; i < lightOccs.length; i += MAX_ITEMS_PER_CHUNK) {
+            chunks.push(lightOccs.slice(i, i + MAX_ITEMS_PER_CHUNK));
         }
 
-        // Fill docx XML for download (if needed)
+        const mappingAggregate = {}; // id -> key
+
+        for (let ci = 0; ci < chunks.length; ci++) {
+            const chunk = chunks[ci];
+
+            const mappingPrompt = `
+  You map placeholder occurrences ("slots") in a legal document to the best user field keys.
+  
+  Return ONLY JSON like:
+  { "h0001": "company_name", "x0007": "investor_email", ... }
+  
+  Guidance:
+  - Use labelGuess, hasDollar, and the textWindow (surrounding context) to decide.
+  - If two fields are similar, prefer the one whose label matches labelGuess or appears in textWindow.
+  - Signature block hints:
+    - "By:" usually expects a full name or signature name.
+    - "Name:" expects a person or entity name.
+    - "Title:" is a role like "CEO".
+    - "Address:" is a mailing address.
+    - "Email:" is an email address.
+  - Currency fields often have hasDollar=true or context words like "Purchase Amount" or "Valuation Cap".
+  
+  Slots (ordered):
+  ${JSON.stringify(chunk, null, 2)}
+  
+  Fields (with values):
+  ${JSON.stringify(fieldsWithValues, null, 2)}
+  `;
+
+            try {
+                const resp = await withTimeout(
+                    openai.chat.completions.create({
+                        model: "gpt-4o-mini",
+                        temperature: 0.1,
+                        response_format: { type: "json_object" },
+                        messages: [
+                            { role: "system", content: "You precisely map each slot id to the best field.key. Return only JSON." },
+                            { role: "user", content: mappingPrompt }
+                        ],
+                    }),
+                    20000,
+                    `GPT slot mapping chunk ${ci + 1}/${chunks.length}`
+                );
+
+                if (resp && !resp.__timeout && !resp.__error) {
+                    let txt = resp.choices[0].message.content.trim().replace(/```json|```/g, "");
+                    let parsed = {};
+                    try { parsed = JSON.parse(txt); } catch {
+                        const sanitized = txt.replace(/[\u0000-\u001f]/g, "");
+                        parsed = JSON.parse(sanitized);
+                    }
+                    Object.assign(mappingAggregate, parsed);
+                }
+            } catch (e) {
+                // Continue on error
+            }
+        }
+
+        // ---------- 3) Build id -> value map ----------
+        const valueByKey = Object.fromEntries(fieldsWithValues.map(f => [f.key, f.value]));
+        const valueById = {};
+        for (const occ of allOccs) {
+            const key = mappingAggregate[occ.id];
+            if (key && valueByKey[key] != null) {
+                valueById[occ.id] = valueByKey[key];
+            }
+        }
+        // ---------- 4) Fill HTML (brackets/underscores replaced; label-only appended) ----------
+        let filledHtml = normalizedHtml || null;
+        if (filledHtml && (format === "preview" || format === "both")) {
+            // Replace from end to start to keep indices valid
+            const htmlRepls = htmlOccs
+                .filter(o => valueById[o.id])
+                .sort((a, b) => b.start - a.start);
+
+            for (const o of htmlRepls) {
+                const valueEsc = (valueById[o.id] || "")
+                    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+                    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+
+                if (o.kind === "label_only") {
+                    // Insert " value" after "Label:"
+                    // Match the specific label occurrence near this position
+                    const label = o.labelGuess || "Value";
+                    // Build a tolerant pattern anchored near the occurrence slice
+                    const anchorSlice = filledHtml.slice(Math.max(0, o.start - 50), o.end + 50);
+                    const localLabelRe = new RegExp(`(${label.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\$&")}\\s*:\\s*)(?!\\S)`);
+                    const replaced = anchorSlice.replace(localLabelRe, `$1${valueEsc}`);
+                    // splice back
+                    filledHtml =
+                        filledHtml.slice(0, Math.max(0, o.start - 50)) +
+                        replaced +
+                        filledHtml.slice(o.end + 50);
+                } else if (o.kind === "label_with_blank" || o.kind === "bracket" || o.kind === "underscore") {
+                    // Replace the blank itself with the value
+                    const rawEsc = o.raw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+                    const re = new RegExp(rawEsc, "g");
+                    // Replace only the first hit nearest to o.start by slicing:
+                    // safer than global replace to avoid changing earlier/other occurrences with same text
+                    const head = filledHtml.slice(0, o.start);
+                    const tail = filledHtml.slice(o.end);
+                    filledHtml = head + valueEsc + tail;
+                }
+            }
+
+            fieldsWithValues.forEach(field => {
+                const placeholderPattern = new RegExp(`\\{\\{${field.key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\}\\}`, 'g');
+                if (placeholderPattern.test(filledHtml)) {
+                    const valueEsc = (field.value || "")
+                        .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+                        .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+                    filledHtml = filledHtml.replace(placeholderPattern, valueEsc);
+                }
+            });
+        }
+
+        // ---------- 5) Fill DOCX XML similarly ----------
         let filledDocxBase64 = null;
         if (format === "download" || format === "both") {
-            const buffer = Buffer.from(normalizedDocumentBuffer, "base64");
-            const zip = await JSZip.loadAsync(buffer);
-            const xml = await zip.file("word/document.xml").async("string");
+            let xmlOut = xml;
 
-            // Replace normalized placeholders ({{key}}) with final values
-            // Use manual replacement instead of docxtemplater to handle tags split across XML boundaries
-            let finalXml = xml;
-            let totalReplacements = 0;
+            const xmlRepls = xmlOccs
+                .filter(o => valueById[o.id])
+                .sort((a, b) => b.start - a.start);
 
-            for (const f of fields) {
-                const normalizedPlaceholder = `{{${f.key}}}`;
-                const value = f.value || f.suggestion || "";
+            for (const o of xmlRepls) {
+                const valEsc = (valueById[o.id] || "")
+                    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+                    .replace(/"/g, "&quot;").replace(/'/g, "&apos;");
 
-                if (!f.key) continue;
-
-                // Escape XML special characters in the value
-                const escapedValue = (value || "")
-                    .replace(/&/g, "&amp;")
-                    .replace(/</g, "&lt;")
-                    .replace(/>/g, "&gt;")
-                    .replace(/"/g, "&quot;")
-                    .replace(/'/g, "&apos;");
-
-                // Replace all occurrences of {{key}} in the XML
-                // This works even when tags are split across <w:t> elements
-                const escapedPlaceholder = normalizedPlaceholder.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-                const regex = new RegExp(escapedPlaceholder, "g");
-                const matches = finalXml.match(regex);
-
-                if (matches && matches.length > 0) {
-                    finalXml = finalXml.replace(regex, escapedValue);
-                    totalReplacements += matches.length;
-                    console.log(`[API] POST /api/download - Docx: Replaced "${f.key}" (${matches.length} occurrence(s))`);
+                if (o.kind === "label_only") {
+                    const label = o.labelGuess || "Value";
+                    // Insert the value after "Label:" locally
+                    const anchor = xmlOut.slice(Math.max(0, o.start - 80), o.end + 80);
+                    const localRe = new RegExp(`(${label.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\$&")}\\s*:\\s*)(?!\\S)`);
+                    const replaced = anchor.replace(localRe, `$1${valEsc}`);
+                    xmlOut = xmlOut.slice(0, Math.max(0, o.start - 80)) + replaced + xmlOut.slice(o.end + 80);
                 } else {
-                    console.log(`[API] POST /api/download - ⚠️ No matches found for "${f.key}" (looking for "${normalizedPlaceholder}")`);
+                    // Replace the blank region with the value
+                    const head = xmlOut.slice(0, o.start);
+                    const tail = xmlOut.slice(o.end);
+                    xmlOut = head + valEsc + tail;
                 }
             }
 
-            // Save back into .docx zip structure
-            zip.file("word/document.xml", finalXml);
-            const modifiedBuffer = await zip.generateAsync({ type: "base64" });
-            filledDocxBase64 = modifiedBuffer;
+            fieldsWithValues.forEach(field => {
+                const placeholderPattern = createXmlBoundaryTolerantRegex(`{{${field.key}}}`);
 
-            console.log(`[API] POST /api/download - Total XML replacements: ${totalReplacements} placeholder(s)`);
+                if (placeholderPattern.test(xmlOut)) {
+                    const valEsc = (field.value || "")
+                        .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+                        .replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+
+                    xmlOut = xmlOut.replace(placeholderPattern, valEsc);
+                }
+            });
+
+            zip.file("word/document.xml", xmlOut);
+            filledDocxBase64 = await zip.generateAsync({ type: "base64" });
         }
 
-        const duration = Date.now() - startTime;
-        console.log(`[API] POST /api/download - ✅ Success (${duration}ms)`);
-
-        // Return based on format
         if (format === "download") {
-            // Return blob directly for download
-            const blobBuffer = Buffer.from(filledDocxBase64, "base64");
+            const blobBuffer = Buffer.from(filledDocxBase64 || "", "base64");
             res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
             res.setHeader("Content-Disposition", `attachment; filename="filled-${Date.now()}.docx"`);
-            res.send(blobBuffer);
+            return res.send(blobBuffer);
         } else {
-            // Return JSON with both filledHtml and filledDocx (base64)
-            res.json({
+            return res.json({
                 filledHtml: filledHtml || null,
                 filledDocx: filledDocxBase64 || null,
             });
@@ -513,20 +631,90 @@ app.post("/api/download", async (req, res) => {
     } catch (err) {
         console.error(`[API] POST /api/download - ❌ Error:`, err.message);
         if (!res.headersSent) {
-            res.status(500).json({ error: "Document fill failed" });
+            return res.status(500).json({ error: "Document fill failed" });
         }
     }
 });
 
-function replaceFirstNOccurrences(source, pattern, replacement, limit) {
-    if (limit <= 0) return source;
-    let count = 0;
-    return source.replace(pattern, (match) => {
-        if (count < limit) {
-            count++;
-            return replacement;
+
+
+// Helper function to create XML boundary-tolerant regex
+function createXmlBoundaryTolerantRegex(pattern) {
+    // Escape special regex characters
+    const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    // Split pattern into character groups that can span XML tags
+    const chars = escaped.split('');
+    // Create regex that allows XML tags between characters
+    const regexParts = chars.map(char => {
+        if (/[a-zA-Z0-9]/.test(char)) {
+            // Allow XML tags before/after alphanumeric characters
+            return `(?:<[^>]*>)*${char}(?:<[^>]*>)*`;
         }
-        return match; // leave remaining matches untouched
+        return char;
+    });
+    return new RegExp(regexParts.join(''), 'g');
+}
+
+// Helper function to replace first N occurrences
+function replaceFirstNOccurrences(text, regex, replacement, maxOccurrences) {
+    if (!text || !regex) return text;
+
+    let count = 0;
+    let result = text;
+
+    // Ensure we have a global regex for matching, but we'll replace one at a time
+    const globalRegex = new RegExp(regex.source, regex.flags.includes('g') ? regex.flags : regex.flags + 'g');
+    const nonGlobalRegex = new RegExp(regex.source, regex.flags.replace('g', ''));
+
+    // Find all matches first
+    const allMatches = [];
+    let match;
+    while ((match = globalRegex.exec(text)) !== null && allMatches.length < maxOccurrences) {
+        allMatches.push({
+            index: match.index,
+            length: match[0].length,
+            text: match[0]
+        });
+        // Prevent infinite loop if regex doesn't advance
+        if (match.index === globalRegex.lastIndex) {
+            globalRegex.lastIndex++;
+        }
+    }
+
+    // Replace from end to start to preserve indices
+    for (let i = allMatches.length - 1; i >= 0; i--) {
+        const m = allMatches[i];
+        result = result.slice(0, m.index) + replacement + result.slice(m.index + m.length);
+    }
+
+    return result;
+}
+
+// Helper function to add timeout to promises
+function withTimeout(promise, ms, label = 'operation') {
+    return new Promise((resolve) => {
+        let settled = false;
+        const timer = setTimeout(() => {
+            if (!settled) {
+                settled = true;
+                resolve({ __timeout: true });
+            }
+        }, ms);
+        promise
+            .then((res) => {
+                if (!settled) {
+                    settled = true;
+                    clearTimeout(timer);
+                    resolve(res);
+                }
+            })
+            .catch((err) => {
+                if (!settled) {
+                    settled = true;
+                    clearTimeout(timer);
+                    resolve({ __error: true, error: err });
+                }
+            });
     });
 }
 

@@ -49,69 +49,87 @@ export function useStreamingChat() {
         },
       ];
 
-      // Stream the response - accumulate JSON in background, don't display raw JSON
+      // Stream the response - accumulate content and display it in real-time
       let fullContent = '';
+      let isJsonResponse = false;
+      
       for await (const chunk of streamChat(apiMessages, context)) {
         if (chunk.done) {
           // When done, try to parse the accumulated content as JSON
-          try {
-            // Clean up the content (remove markdown code blocks if present)
-            let cleanedContent = fullContent.trim();
-            cleanedContent = cleanedContent.replace(/^```json\s*/i, "").replace(/\s*```$/i, "");
-            
-            parsedResponse = JSON.parse(cleanedContent) as ChatResponse;
-            
-            // Update message content based on mode - only show user-friendly content
-            let displayContent = '';
-            if (parsedResponse.mode === 'chat' && parsedResponse.response) {
-              displayContent = parsedResponse.response;
-            } else if (parsedResponse.mode === 'fill') {
-              // For fill mode, show acknowledgment and optionally suggestion/reason
-              displayContent = parsedResponse.ack || '';
-              if (parsedResponse.suggestion && parsedResponse.reason) {
-                if (displayContent) {
-                  displayContent += `\n\n${parsedResponse.reason}`;
-                } else {
-                  displayContent = parsedResponse.reason;
+          // But only if it looks like JSON (starts with { or [)
+          const cleanedContent = fullContent.trim();
+          const looksLikeJson = cleanedContent.startsWith('{') || cleanedContent.startsWith('[');
+          
+          if (looksLikeJson) {
+            try {
+              // Clean up the content (remove markdown code blocks if present)
+              let jsonContent = cleanedContent.replace(/^```json\s*/i, "").replace(/\s*```$/i, "");
+              
+              parsedResponse = JSON.parse(jsonContent) as ChatResponse;
+              isJsonResponse = true;
+              
+              // Update message content based on mode - only show user-friendly content
+              let displayContent = '';
+              if (parsedResponse.mode === 'chat' && parsedResponse.response) {
+                displayContent = parsedResponse.response;
+              } else if (parsedResponse.mode === 'fill') {
+                // For fill mode, show acknowledgment and optionally suggestion/reason
+                displayContent = parsedResponse.ack || '';
+                if (parsedResponse.suggestion && parsedResponse.reason) {
+                  if (displayContent) {
+                    displayContent += `\n\n${parsedResponse.reason}`;
+                  } else {
+                    displayContent = parsedResponse.reason;
+                  }
+                } else if (parsedResponse.reason) {
+                  if (displayContent) {
+                    displayContent += `\n\n${parsedResponse.reason}`;
+                  } else {
+                    displayContent = parsedResponse.reason;
+                  }
                 }
-              } else if (parsedResponse.reason) {
-                if (displayContent) {
-                  displayContent += `\n\n${parsedResponse.reason}`;
-                } else {
-                  displayContent = parsedResponse.reason;
-                }
+              } else {
+                // Fallback - use cleaned content
+                displayContent = cleanedContent || 'Response received';
               }
-            } else {
-              // Fallback - try to parse as plain text or show error
-              displayContent = cleanedContent || 'Response received';
+              
+              // Only update message with parsed, user-friendly content
+              setMessages(prev =>
+                prev.map(msg =>
+                  msg.id === assistantMsgId
+                    ? { ...msg, content: displayContent || 'Response received' }
+                    : msg
+                )
+              );
+            } catch (parseError) {
+              // If parsing fails but content looks like JSON, log error but show content
+              console.warn('Failed to parse response JSON:', parseError);
+              // Show the actual content to the user instead of generic error
+              setMessages(prev =>
+                prev.map(msg =>
+                  msg.id === assistantMsgId
+                    ? { ...msg, content: cleanedContent || 'Response received' }
+                    : msg
+                )
+              );
             }
-            
-            // Only update message with parsed, user-friendly content
+          } else {
+            // Not JSON - just display the content as-is
             setMessages(prev =>
               prev.map(msg =>
                 msg.id === assistantMsgId
-                  ? { ...msg, content: displayContent || 'Response received' }
-                  : msg
-              )
-            );
-          } catch (parseError) {
-            // If parsing fails, show a friendly error message
-            console.warn('Failed to parse response JSON:', parseError);
-            setMessages(prev =>
-              prev.map(msg =>
-                msg.id === assistantMsgId
-                  ? { ...msg, content: 'I received your message, but had trouble processing the response. Please try again.' }
+                  ? { ...msg, content: cleanedContent || 'Response received' }
                   : msg
               )
             );
           }
           break;
         }
-        // Accumulate content in background - don't display raw JSON
+        // Accumulate content but don't display raw JSON - keep content empty during streaming
+        // The TypingIndicator component will show the animated dots instead
         if (chunk.content) {
           fullContent += chunk.content;
-          // Keep message content empty during streaming - user will see TypingIndicator
-          // Don't update the message with raw JSON content
+          // Keep message content empty during streaming - TypingIndicator handles the visual feedback
         }
         if (chunk.error) {
           throw new Error(chunk.error);

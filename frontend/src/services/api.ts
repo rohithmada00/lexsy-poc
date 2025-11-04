@@ -111,11 +111,15 @@ export async function fillDocument(
   fields: DocumentField[],
   format: 'preview' | 'download' | 'both' = 'both'
 ): Promise<FillDocumentResponse> {
-  // Transform fields to match backend expectations
+  // Transform fields to match backend expectations (send full field data for GPT matching)
   const transformedFields = fields.map(f => ({
     key: f.key,
+    label: f.label,
     value: f.value,
     suggestion: f.exampleValue, // Map exampleValue to suggestion
+    exampleValue: f.exampleValue,
+    description: f.description,
+    type: f.type,
   }));
 
   const response = await fetch(`${API_BASE_URL}/api/download?format=${format}`, {

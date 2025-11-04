@@ -7,6 +7,11 @@ interface ChatMessageProps {
 export default function ChatMessage({ message }: ChatMessageProps) {
   const isUser = message.role === 'user';
 
+  // Don't render message if content is empty (e.g., during streaming)
+  if (!message.content || message.content.trim() === '') {
+    return null;
+  }
+
   // Simple markdown parser for bold text (**text**)
   const parseMarkdown = (text: string): string => {
     // Convert **text** to <strong>text</strong>

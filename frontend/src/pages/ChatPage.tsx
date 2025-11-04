@@ -68,9 +68,12 @@ export default function ChatPage() {
       };
       addMessage(introMsg);
 
-      // Add greeting with first field
+      // Add greeting with first field - use question if available, otherwise generate one
       const firstField = analysis.aiAnalysis.fields[0];
-      const greeting = `Alright, let's begin with **${firstField.label}**.${firstField.exampleValue ? ` For example: _${firstField.exampleValue}_.` : ''} ${firstField.legalSuggestions ? `💡 ${firstField.legalSuggestions}` : ''} What would you like to enter?`;
+      const question = firstField.question || `What would you like to enter for **${firstField.label}**?`;
+      const greeting = firstField.legalSuggestions 
+        ? `${question}\n\n💡 ${firstField.legalSuggestions}`
+        : question;
 
 
       const greetingMsg: ChatMessageType = {
@@ -129,7 +132,11 @@ export default function ChatPage() {
             if (nextFieldIndex < fields.length) {
               setCurrentFieldIndex(nextFieldIndex);
               const nextField = updatedFields[nextFieldIndex];
-              const nextQuestion = `Excellent. Now let's proceed to **${nextField.label}**.${nextField.exampleValue ? ` For instance: ${nextField.exampleValue}.` : ''} ${nextField.legalSuggestions ? `Note: ${nextField.legalSuggestions}` : ''} Please provide the value.`;
+              // Use question field if available, otherwise generate one
+              const nextQuestionText = nextField.question || `What would you like to enter for **${nextField.label}**?`;
+              const nextQuestion = nextField.legalSuggestions 
+                ? `Excellent! ✅\n\n${nextQuestionText}\n\n💡 ${nextField.legalSuggestions}`
+                : `Excellent! ✅\n\n${nextQuestionText}`;
 
               // Add AI response as message
               setTimeout(() => {
@@ -241,18 +248,20 @@ export default function ChatPage() {
                 <span className="shrink-0">• {fields.length} placeholder{fields.length !== 1 ? 's' : ''} found</span>
               </p>
             </div>
-            <Button
-              onClick={() => {
-                reset();
-                navigate('/upload');
-              }}
-              variant="outline"
-              size="sm"
-              className="text-xs opacity-70 hover:opacity-100 border-gray-300 dark:border-slate-600 text-gray-600 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300 shrink-0"
-            >
-              <span className="material-symbols-outlined mr-1.5 text-sm">refresh</span>
-              Start Over
-            </Button>
+            <div className="flex gap-2 shrink-0">
+              <Button
+                onClick={() => {
+                  reset();
+                  navigate('/upload');
+                }}
+                variant="outline"
+                size="sm"
+                className="text-xs opacity-70 hover:opacity-100 border-gray-300 dark:border-slate-600 text-gray-600 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300"
+              >
+                <span className="material-symbols-outlined mr-1.5 text-sm">refresh</span>
+                Start Over
+              </Button>
+            </div>
           </div>
 
           {fields.length > 0 && (
@@ -319,16 +328,18 @@ export default function ChatPage() {
         </div>
       )}
 
-      {/* Sticky Chat Input at Bottom */}
-      <div className="bg-gray-50 dark:bg-slate-900 sticky bottom-0">
-        <div className="max-w-3xl mx-auto px-4 sm:px-6 py-4">
-          <ChatInput
-            onSend={handleSend}
-            disabled={isStreaming}
-            placeholder={isStreaming ? 'AI is typing...' : 'Ask anything'}
-          />
+      {/* Sticky Chat Input at Bottom - Hide when all fields are filled */}
+      {!allFieldsFilled && (
+        <div className="bg-gray-50 dark:bg-slate-900 sticky bottom-0">
+          <div className="max-w-3xl mx-auto px-4 sm:px-6 py-4">
+            <ChatInput
+              onSend={handleSend}
+              disabled={isStreaming}
+              placeholder={isStreaming ? 'AI is typing...' : 'Ask anything'}
+            />
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }

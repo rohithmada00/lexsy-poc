@@ -7,6 +7,7 @@ export interface DocumentField {
   required?: boolean;              // Whether field is required
   exampleValue?: string;           // Example value based on legal norms
   legalSuggestions?: string;     // Short legal guidance
+  question?: string;               // Intuitive question to ask the user (e.g., "What is the investor's email address?")
   value?: string;                  // User-provided value
 }
 
